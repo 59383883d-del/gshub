@@ -1,0 +1,2195 @@
+--[[
+=====================================================================
+  GS Hub  |  Roblox Rivals 竞争者   v2.0.0
+  ---------------------------------------------------------------
+  单文件成品  |  由 build.py 从 src/ 合成, 请勿直接改这个文件
+  源码模块: 00_boot.lua + 10_core.lua + 90_ext.lua
+  按键: RightShift 主菜单   K 扩展面板   V ESP 开关   H HUD 开关   End 卸载
+=====================================================================
+]]
+
+-- ===== BEGIN 00_boot.lua (122 行) =====
+--[[
+=====================================================================
+  GS Hub  |  Roblox Rivals 竞争者   v2.0.0  (完整包)
+  ---------------------------------------------------------------
+  模块:
+    Aimbot      自瞄 / FOV / 平滑 / 提前量 / 自动开火
+    Bring       敌人拉头顶 (Stack / Hat)
+    Skins       客户端换肤 (7 套预设 + 自定义贴图)
+    ESP         玩家名字 / 距离 / 血量 / 方框   [新增]
+    HUD         帧率 / 延迟 / 敌人数 / 模块状态  [新增]
+    Guard       运行时看护, 出错自动降级          [新增]
+    Anti        防踢 / 防传送 / 反检测
+    Panel       主面板 (RightShift) + 扩展面板 (K)
+  ---------------------------------------------------------------
+  环境: 任何支持 Luau 注入的执行器 (Delta / Wave / Fluxus / Synapse ...)
+  按键: RightShift 主菜单   K 扩展面板   End 紧急卸载
+  结构: 00_boot (启动层) + 10_core (内核) + 90_ext (扩展层)
+        由 build.py 合成为单文件 GSHub.lua
+=====================================================================
+]]
+
+--=====================================================================
+-- BOOT-0. 执行器能力探测
+--=====================================================================
+local ENV = {}
+ENV.VERSION = "2.0.0"
+ENV.NAME = "GS Hub"
+ENV.BUILD = "2026-11-23"
+
+local function cap(fnName)
+	local ok, v = pcall(function() return _G[fnName] end)
+	if not ok then return false end
+	return v ~= nil
+end
+
+ENV.caps = {
+	writefile    = cap("writefile"),
+	readfile     = cap("readfile"),
+	isfile       = cap("isfile"),
+	makefolder   = cap("makefolder"),
+	listfiles    = cap("listfiles"),
+	delfile      = cap("delfile"),
+	setclipboard = cap("setclipboard"),
+	getclipboard = cap("getclipboard"),
+	httpget      = cap("httpget"),
+	queue_teleport = cap("queue_on_teleport"),
+	identify     = cap("identifyexecutor"),
+}
+
+do
+	local ok, hasDraw = pcall(function() return Drawing and Drawing.new end)
+	ENV.caps.drawing = (ok and hasDraw ~= nil) and true or false
+end
+
+do
+	local ok, id = pcall(function() return identifyexecutor and identifyexecutor() end)
+	ENV.caps.executor = (ok and type(id) == "string") and id or "unknown"
+end
+
+--=====================================================================
+-- BOOT-1. 兜底: task / 定时器
+--    部分老执行器没有 task 库, 用 wait/spawn 顶上, 保证内核不崩
+--=====================================================================
+if type(task) ~= "table" then
+	local T = {}
+	T.wait = function(t) if wait then wait(t or 0) end end
+	T.spawn = function(fn)
+		if spawn then spawn(fn) else pcall(fn) end
+	end
+	T.delay = function(t, fn)
+		if delay then delay(t or 0, fn) else pcall(fn) end
+	end
+	T.cancel = function() end
+	task = T
+end
+
+if type(task.spawn) ~= "function" then
+	task.spawn = function(fn)
+		if spawn then spawn(fn) else pcall(fn) end
+	end
+end
+
+--=====================================================================
+-- BOOT-2. 兜底: 剪贴板
+--    没有 setclipboard/getclipboard 的执行器, 配置导入导出降级为面板显示
+--=====================================================================
+ENV.clipboardOut = function(text)
+	if type(setclipboard) == "function" then
+		local ok = pcall(setclipboard, text)
+		if ok then return true end
+	end
+	return false
+end
+
+ENV.clipboardIn = function()
+	if type(getclipboard) == "function" then
+		local ok, v = pcall(getclipboard)
+		if ok and type(v) == "string" then return v end
+	end
+	return nil
+end
+
+--=====================================================================
+-- BOOT-3. 兜底: 安全调用包装 (统一样式的日志)
+--=====================================================================
+ENV.errors = {}
+ENV.logError = function(where, err)
+	local msg = tostring(err or "unknown")
+	table.insert(ENV.errors, { where = tostring(where), msg = msg, t = os.time() })
+	while #ENV.errors > 12 do table.remove(ENV.errors, 1) end
+end
+
+ENV.safe = function(where, fn, ...)
+	local ok, res = pcall(fn, ...)
+	if not ok then
+		ENV.logError(where, res)
+		return nil
+	end
+	return res
+end
+
+_G.GSHUB_ENV = ENV
+
+-- ===== END 00_boot.lua =====
+
+-- ===== BEGIN 10_core.lua (1134 行) =====
+--[[
+=====================================================================
+  GS Hub  |  Roblox Rivals 竞争者  v1.0.0
+  ---------------------------------------------------------------
+  模块: Aimbot / 敌人拉头顶 / 全皮肤(客户端) / 防踢防封(客户端层)
+  环境: 任何支持 Luau 注入的执行器 (Delta / Wave / Fluxus / Synapse ...)
+  按键: RightShift 开/关菜单     End 紧急卸载
+  说明: 只读取实例数据 + 模拟输入, 不读写进程内存, 不改游戏文件
+=====================================================================
+]]
+
+--=====================================================================
+-- 0. 清理上一次加载的实例
+--=====================================================================
+if getgenv and getgenv().GSHub then
+	pcall(function()
+		getgenv().GSHub.unload()
+	end)
+end
+
+--=====================================================================
+-- 1. 服务与全局配置
+--=====================================================================
+local cloneref = cloneref or function(o) return o end
+
+local Players = cloneref(game:GetService("Players"))
+local RunService = cloneref(game:GetService("RunService"))
+local UserInputService = cloneref(game:GetService("UserInputService"))
+local TweenService = cloneref(game:GetService("TweenService"))
+local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
+local Workspace = cloneref(game:GetService("Workspace"))
+local TeleportService = cloneref(game:GetService("TeleportService"))
+local HttpService = cloneref(game:GetService("HttpService"))
+local StarterGui = cloneref(game:GetService("StarterGui"))
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+local VERSION = "2.0.0"
+local HUB_NAME = "GS Hub"
+local CONFIG_DIR = "GSHub"
+local CONFIG_FILE = CONFIG_DIR .. "/config.json"
+
+local Config = {
+	aimbot = {
+		enabled = true,
+		key = "E",
+		mode = "Hold",          -- Hold / Toggle / Always
+		fov = 140,
+		smooth = 2.5,           -- 1 = 瞬间锁死, 越大越慢越像人
+		part = "Head",          -- Head / HumanoidRootPart / UpperTorso
+		wallCheck = false,
+		prediction = 0.12,      -- 提前量(秒), 按自己 ping 微调
+		autoFire = false,
+		fireDelay = 0.06,
+		teamCheck = true,
+		fovCircle = true,
+	},
+	bring = {
+		enabled = false,
+		key = "F",
+		mode = "Stack",         -- Stack(叠在头顶) / Hat(焊死在头顶)
+		offset = 2.0,
+		spacing = 2.0,
+		maxDist = 800,
+	},
+	skins = {
+		enabled = false,
+		preset = "Neon",
+		texture = "",
+	},
+	anti = {
+		antiKick = true,
+		antiTeleport = true,
+		antiDetect = true,
+	},
+	ui = {
+		key = "RightShift",
+		panicKey = "End",
+	},
+}
+
+--=====================================================================
+-- 2. 通用小工具
+--=====================================================================
+local Connections = {}
+local function track(conn)
+	table.insert(Connections, conn)
+	return conn
+end
+
+local function try(fn, ...)
+	local ok, res = pcall(fn, ...)
+	if ok then return res end
+	return nil
+end
+
+local function notify(text)
+	if try(function()
+		StarterGui:SetCore("SendNotification", { Title = HUB_NAME, Text = text, Duration = 3 })
+	end) then return end
+	print("[" .. HUB_NAME .. "] " .. text)
+end
+
+local function keyCode(name)
+	local ok, code = pcall(function() return Enum.KeyCode[name] end)
+	if ok then return code end
+	return Enum.KeyCode.E
+end
+
+local function saveConfig()
+	if not writefile then return end
+	try(function()
+		if makefolder then makefolder(CONFIG_DIR) end
+		writefile(CONFIG_FILE, HttpService:JSONEncode(Config))
+	end)
+end
+
+local function loadConfig()
+	if not (isfile and readfile) then return end
+	local raw = try(readfile, CONFIG_FILE)
+	if not raw then return end
+	local ok, data = pcall(function() return HttpService:JSONDecode(raw) end)
+	if not ok or type(data) ~= "table" then return end
+	for section, values in pairs(data) do
+		if type(values) == "table" and type(Config[section]) == "table" then
+			for key, value in pairs(values) do
+				if Config[section][key] ~= nil and type(Config[section][key]) == type(value) then
+					Config[section][key] = value
+				end
+			end
+		end
+	end
+end
+loadConfig()
+
+--=====================================================================
+-- 3. 实体缓存
+--=====================================================================
+local Entity = {}
+
+function Entity.get(plr)
+	if plr == LocalPlayer then return nil end
+	local char = plr.Character
+	if not char then return nil end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not hum or not root or hum.Health <= 0 then return nil end
+	return {
+		player = plr,
+		char = char,
+		hum = hum,
+		root = root,
+		head = char:FindFirstChild("Head") or root,
+	}
+end
+
+function Entity.list()
+	local out = {}
+	local myTeam = LocalPlayer.Team
+	local checkTeam = Config.aimbot.teamCheck and myTeam ~= nil
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LocalPlayer then
+			local e = Entity.get(plr)
+			if e then
+				local skip = false
+				if checkTeam and plr.Team == myTeam then skip = true end
+				if not skip then
+					table.insert(out, e)
+				end
+			end
+		end
+	end
+	return out
+end
+
+local function isVisible(part, targetChar)
+	local params = RaycastParams.new()
+	local ok = pcall(function()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+	end)
+	if not ok then
+		pcall(function() params.FilterType = Enum.RaycastFilterType.Blacklist end)
+	end
+	params.FilterDescendantsInstances = { LocalPlayer.Character, targetChar }
+	params.IgnoreWater = true
+
+	local origin = Camera.CFrame.Position
+	local result = Workspace:Raycast(origin, part.Position - origin, params)
+	return result == nil
+end
+
+function Entity.part(e)
+	local p = e.char:FindFirstChild(Config.aimbot.part)
+	if p and p:IsA("BasePart") then return p end
+	return e.head
+end
+
+--=====================================================================
+-- 4. Aimbot
+--=====================================================================
+local Aimbot = {
+	toggled = false,
+	lastFire = 0,
+	target = nil,
+}
+
+local fovCircle = nil
+if Drawing and Drawing.new then
+	fovCircle = Drawing.new("Circle")
+	fovCircle.Thickness = 1.5
+	fovCircle.NumSides = 72
+	fovCircle.Filled = false
+	fovCircle.Transparency = 0.65
+	fovCircle.Color = Color3.fromRGB(140, 200, 255)
+	fovCircle.Visible = false
+end
+
+function Aimbot.isActive()
+	if not Config.aimbot.enabled then return false end
+	local mode = Config.aimbot.mode
+	if mode == "Always" then return true end
+	if mode == "Toggle" then return Aimbot.toggled end
+	return UserInputService:IsKeyDown(keyCode(Config.aimbot.key))
+end
+
+function Aimbot.findTarget()
+	local mouse = UserInputService:GetMouseLocation()
+	local best, bestScore = nil, math.huge
+
+	for _, e in ipairs(Entity.list()) do
+		local part = Entity.part(e)
+		if part then
+			local sp, onScreen = Camera:WorldToScreenPoint(part.Position)
+			if onScreen then
+				local delta = Vector2.new(sp.X - mouse.X, sp.Y - mouse.Y)
+				local dist = delta.Magnitude
+				if dist <= Config.aimbot.fov then
+					local okWall = true
+					if Config.aimbot.wallCheck then
+						okWall = isVisible(part, e.char)
+					end
+					if okWall then
+						local score = dist + (e.hum.Health / math.max(e.hum.MaxHealth, 1)) * 12
+						if score < bestScore then
+							best, bestScore = { entity = e, part = part }, score
+						end
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function predictPosition(part)
+	local lead = Config.aimbot.prediction
+	if lead <= 0 then return part.Position end
+	local ok, vel = pcall(function() return part.AssemblyLinearVelocity end)
+	if not ok or not vel then return part.Position end
+	return part.Position + vel * lead
+end
+
+function Aimbot.lookAt(part)
+	local aimPos = predictPosition(part)
+	local sp, onScreen = Camera:WorldToScreenPoint(aimPos)
+	if not onScreen then return end
+
+	local smooth = math.max(Config.aimbot.smooth, 1)
+	local factor = 1 / smooth
+
+	if mousemoverel then
+		local mouse = UserInputService:GetMouseLocation()
+		local dx = (sp.X - mouse.X) * factor
+		local dy = (sp.Y - mouse.Y) * factor
+		if math.abs(dx) < 0.4 then dx = 0 end
+		if math.abs(dy) < 0.4 then dy = 0 end
+		if dx ~= 0 or dy ~= 0 then
+			pcall(mousemoverel, dx, dy)
+		end
+	else
+		local camPos = Camera.CFrame.Position
+		local dir = (aimPos - camPos).Unit
+		if smooth > 1 then
+			dir = Camera.CFrame.LookVector:Lerp(dir, factor)
+		end
+		Camera.CFrame = CFrame.lookAt(camPos, camPos + dir)
+	end
+end
+
+function Aimbot.fire()
+	local now = os.clock()
+	if now - Aimbot.lastFire < Config.aimbot.fireDelay then return end
+	Aimbot.lastFire = now
+	if mouse1click then
+		pcall(mouse1click)
+	else
+		pcall(function()
+			local vu = game:GetService("VirtualUser")
+			vu:ClickButton1(Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2))
+		end)
+	end
+end
+
+track(RunService.RenderStepped:Connect(function()
+	if fovCircle then
+		fovCircle.Visible = Config.aimbot.enabled and Config.aimbot.fovCircle
+		if fovCircle.Visible then
+			fovCircle.Position = UserInputService:GetMouseLocation()
+			fovCircle.Radius = Config.aimbot.fov
+		end
+	end
+
+	if not Aimbot.isActive() then return end
+
+	local target = Aimbot.findTarget()
+	Aimbot.target = target
+	if not target then return end
+
+	Aimbot.lookAt(target.part)
+
+	if Config.aimbot.autoFire then
+		Aimbot.fire()
+	end
+end))
+
+--=====================================================================
+-- 5. Bring: 把敌人拉到头顶
+--=====================================================================
+local Bring = {
+	welds = {},
+	active = false,
+}
+
+function Bring.clearWelds()
+	for _, w in pairs(Bring.welds) do
+		pcall(function() w:Destroy() end)
+	end
+	Bring.welds = {}
+end
+
+function Bring.shouldBring(plr)
+	if plr == LocalPlayer then return false end
+	if Config.aimbot.teamCheck and LocalPlayer.Team and plr.Team == LocalPlayer.Team then
+		return false
+	end
+	return true
+end
+
+function Bring.distanceOk(root)
+	local myChar = LocalPlayer.Character
+	local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+	if not myRoot then return false end
+	return (root.Position - myRoot.Position).Magnitude <= Config.bring.maxDist
+end
+
+function Bring.update()
+	local myChar = LocalPlayer.Character
+	local myHead = myChar and myChar:FindFirstChild("Head")
+	if not myHead then
+		Bring.clearWelds()
+		return
+	end
+
+	local index = 0
+	for _, e in ipairs(Entity.list()) do
+		if Bring.shouldBring(e.player) and Bring.distanceOk(e.root) then
+			index = index + 1
+			local goal = myHead.CFrame * CFrame.new(0, Config.bring.offset + (index - 1) * Config.bring.spacing, 0)
+
+			if Config.bring.mode == "Hat" then
+				if not Bring.welds[e.root] then
+					e.root.CFrame = goal
+					local weld = Instance.new("WeldConstraint")
+					weld.Part0 = myHead
+					weld.Part1 = e.root
+					weld.Parent = myHead
+					Bring.welds[e.root] = weld
+				end
+			else
+				e.root.CFrame = goal
+				pcall(function()
+					e.root.AssemblyLinearVelocity = Vector3.zero
+					e.root.AssemblyAngularVelocity = Vector3.zero
+				end)
+			end
+		end
+	end
+end
+
+track(RunService.Heartbeat:Connect(function()
+	if Config.bring.enabled then
+		Bring.active = true
+		Bring.update()
+	elseif Bring.active then
+		Bring.active = false
+		Bring.clearWelds()
+	end
+end))
+
+--=====================================================================
+-- 6. Skins
+--=====================================================================
+local Skins = {
+	presets = {
+		Neon    = { color = Color3.fromRGB(0, 220, 255), material = Enum.Material.Neon },
+		Gold    = { color = Color3.fromRGB(255, 196, 60), material = Enum.Material.Foil },
+		Blood   = { color = Color3.fromRGB(150, 15, 20), material = Enum.Material.Metal },
+		Void    = { color = Color3.fromRGB(24, 18, 38), material = Enum.Material.Neon },
+		Ice     = { color = Color3.fromRGB(190, 235, 255), material = Enum.Material.Glass },
+		Rainbow = { rainbow = true },
+		Default = { reset = true },
+	},
+}
+
+function Skins.applyToPart(part, preset)
+	if not part:IsA("BasePart") then return end
+	if preset.reset then
+		part.Color = Color3.fromRGB(163, 162, 165)
+		part.Material = Enum.Material.SmoothPlastic
+		return
+	end
+	if preset.color then part.Color = preset.color end
+	if preset.material then part.Material = preset.material end
+end
+
+function Skins.apply(tool)
+	if not Config.skins.enabled then return end
+	if not tool or not tool:IsA("Tool") then return end
+
+	local preset = Skins.presets[Config.skins.preset] or Skins.presets.Neon
+	local hue = 0
+
+	for _, d in ipairs(tool:GetDescendants()) do
+		if d:IsA("BasePart") then
+			Skins.applyToPart(d, preset)
+			if preset.rainbow then
+				hue = (hue + 0.13) % 1
+				d.Color = Color3.fromHSV(hue, 0.8, 1)
+				d.Material = Enum.Material.Neon
+			end
+			if Config.skins.texture ~= "" and d:IsA("MeshPart") then
+				pcall(function() d.TextureID = Config.skins.texture end)
+			end
+		elseif d:IsA("Decal") or d:IsA("Texture") then
+			if Config.skins.texture ~= "" then
+				pcall(function() d.Texture = Config.skins.texture end)
+			end
+		end
+	end
+end
+
+function Skins.applyAll()
+	local char = LocalPlayer.Character
+	if not char then return end
+	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+	local containers = { char }
+	if backpack then table.insert(containers, backpack) end
+	for _, box in ipairs(containers) do
+		for _, item in ipairs(box:GetChildren()) do
+			if item:IsA("Tool") then
+				Skins.apply(item)
+			end
+		end
+	end
+end
+
+local skinClock = 0
+track(RunService.Heartbeat:Connect(function(dt)
+	skinClock = skinClock + dt
+	if skinClock < 0.5 then return end
+	skinClock = 0
+	if Config.skins.enabled then Skins.applyAll() end
+end))
+
+function Skins.scan()
+	local found = {}
+	local function walk(container, depth)
+		if depth > 3 then return end
+		for _, obj in ipairs(container:GetChildren()) do
+			local name = obj.Name:lower()
+			if name:find("skin") or name:find("cosmetic") or name:find("wrap") then
+				for _, d in ipairs(obj:GetDescendants()) do
+					if d:IsA("MeshPart") or d:IsA("Decal") or d:IsA("Texture") then
+						table.insert(found, d)
+					end
+				end
+			end
+			if obj:IsA("Folder") or obj:IsA("Model") or obj:IsA("Configuration") then
+				walk(obj, depth + 1)
+			end
+		end
+	end
+	walk(ReplicatedStorage, 0)
+	return found
+end
+
+--=====================================================================
+-- 7. Anti: 防踢 / 防传送 / 反检测
+--=====================================================================
+local Anti = {
+	installed = false,
+	restore = {},
+}
+
+function Anti.setup()
+	if Anti.installed then return end
+	Anti.installed = true
+
+	-- 7.1 拦 Kick
+	if Config.anti.antiKick and getrawmetatable and setreadonly then
+		try(function()
+			local mt = getrawmetatable(game)
+			local oldIndex = mt.__index
+			local oldNamecall = mt.__namecall
+
+			setreadonly(mt, false)
+			mt.__index = function(self, key)
+				if key == "Kick" and Config.anti.antiKick then
+					if self == LocalPlayer or self == Players then
+						return function() end
+					end
+				end
+				if type(oldIndex) == "function" then
+					return oldIndex(self, key)
+				end
+				return nil
+			end
+			if oldNamecall then
+				mt.__namecall = function(self, ...)
+					local method = getnamecallmethod and getnamecallmethod()
+					if method == "Kick" and Config.anti.antiKick then
+						return nil
+					end
+					return oldNamecall(self, ...)
+				end
+			end
+			setreadonly(mt, true)
+
+			table.insert(Anti.restore, function()
+				pcall(function()
+					setreadonly(mt, false)
+					mt.__index = oldIndex
+					mt.__namecall = oldNamecall
+					setreadonly(mt, true)
+				end)
+			end)
+		end)
+	end
+
+	-- 7.2 拦传送
+	if Config.anti.antiTeleport and hookfunction then
+		local methods = { "Teleport", "TeleportAsync", "TeleportToPlaceInstance", "TeleportToPrivateServer", "TeleportPartyAsync" }
+		for _, name in ipairs(methods) do
+			try(function()
+				local fn = TeleportService[name]
+				if type(fn) == "function" then
+					local hooked = hookfunction(fn, function()
+						return nil
+					end)
+					table.insert(Anti.restore, function()
+						pcall(function() hookfunction(hooked, fn) end)
+					end)
+				end
+			end)
+		end
+	end
+
+	-- 7.3 反检测: 遮蔽调用栈来源
+	if Config.anti.antiDetect and hookfunction and getcallingscript then
+		try(function()
+			local old = getcallingscript
+			local hooked = hookfunction(old, function()
+				return nil
+			end)
+			table.insert(Anti.restore, function()
+				pcall(function() hookfunction(hooked, old) end)
+			end)
+		end)
+	end
+end
+
+function Anti.teardown()
+	for _, fn in ipairs(Anti.restore) do
+		pcall(fn)
+	end
+	Anti.restore = {}
+	Anti.installed = false
+end
+
+Anti.setup()
+
+--=====================================================================
+-- 8. UI
+--=====================================================================
+local UI = { open = true }
+
+local function new(class, props, parent)
+	local obj = Instance.new(class)
+	for k, v in pairs(props or {}) do
+		obj[k] = v
+	end
+	if parent then obj.Parent = parent end
+	return obj
+end
+
+local ACCENT = Color3.fromRGB(120, 200, 255)
+local BG = Color3.fromRGB(18, 19, 24)
+local ROW = Color3.fromRGB(30, 32, 40)
+local TEXT_DIM = Color3.fromRGB(150, 155, 170)
+
+function UI.build()
+	local gui = new("ScreenGui", {
+		Name = "GSHub",
+		ResetOnSpawn = false,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		IgnoreGuiInset = true,
+	})
+
+	local parented = try(function()
+		gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+		return true
+	end)
+	if not parented then
+		gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+	end
+
+	local main = new("Frame", {
+		Name = "Main",
+		Size = UDim2.new(0, 276, 0, 452),
+		Position = UDim2.new(0, 24, 0, 120),
+		BackgroundColor3 = BG,
+		BorderSizePixel = 0,
+	}, gui)
+	new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
+	new("UIStroke", { Color = Color3.fromRGB(45, 48, 60), Thickness = 1 }, main)
+
+	local bar = new("Frame", {
+		Name = "Bar",
+		Size = UDim2.new(1, 0, 0, 40),
+		BackgroundColor3 = Color3.fromRGB(24, 26, 33),
+		BorderSizePixel = 0,
+	}, main)
+	new("UICorner", { CornerRadius = UDim.new(0, 10) }, bar)
+
+	new("TextLabel", {
+		Text = "GS  HUB",
+		Position = UDim2.new(0, 14, 0, 7),
+		Size = UDim2.new(0, 160, 0, 17),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		TextSize = 14,
+		TextColor3 = Color3.fromRGB(235, 240, 250),
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, bar)
+
+	new("TextLabel", {
+		Text = "Rivals  |  v" .. VERSION,
+		Position = UDim2.new(0, 14, 0, 24),
+		Size = UDim2.new(0, 160, 0, 12),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		TextSize = 10,
+		TextColor3 = TEXT_DIM,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, bar)
+
+	local closeBtn = new("TextButton", {
+		Text = "×",
+		Position = UDim2.new(1, -34, 0, 6),
+		Size = UDim2.new(0, 26, 0, 26),
+		BackgroundColor3 = Color3.fromRGB(40, 42, 52),
+		TextColor3 = Color3.fromRGB(220, 220, 230),
+		Font = Enum.Font.GothamBold,
+		TextSize = 16,
+		AutoButtonColor = false,
+	}, bar)
+	new("UICorner", { CornerRadius = UDim.new(0, 6) }, closeBtn)
+	closeBtn.MouseButton1Click:Connect(function()
+		UI.open = false
+		main.Visible = false
+	end)
+
+	local content = new("ScrollingFrame", {
+		Name = "Content",
+		Position = UDim2.new(0, 6, 0, 46),
+		Size = UDim2.new(1, -12, 1, -56),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
+		ScrollBarImageColor3 = ACCENT,
+		CanvasSize = UDim2.new(0, 0, 0, 0),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	}, main)
+	new("UIListLayout", {
+		Padding = UDim.new(0, 5),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}, content)
+	new("UIPadding", { PaddingRight = UDim.new(0, 4) }, content)
+
+	local function section(text)
+		return new("TextLabel", {
+			Text = text,
+			Size = UDim2.new(1, 0, 0, 22),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamBold,
+			TextSize = 11,
+			TextColor3 = ACCENT,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}, content)
+	end
+
+	local function rowBase(height)
+		return new("Frame", {
+			Size = UDim2.new(1, 0, 0, height),
+			BackgroundColor3 = ROW,
+			BorderSizePixel = 0,
+		}, content)
+	end
+
+	local function addToggle(text, getter, setter)
+		local row = rowBase(28)
+		new("UICorner", { CornerRadius = UDim.new(0, 6) }, row)
+
+		new("TextLabel", {
+			Text = text,
+			Position = UDim2.new(0, 10, 0, 0),
+			Size = UDim2.new(0, 190, 1, 0),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.Gotham,
+			TextSize = 12,
+			TextColor3 = Color3.fromRGB(225, 228, 238),
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}, row)
+
+		local state = new("Frame", {
+			Position = UDim2.new(1, -46, 0, 6),
+			Size = UDim2.new(0, 36, 0, 16),
+			BackgroundColor3 = getter() and ACCENT or Color3.fromRGB(55, 58, 70),
+			BorderSizePixel = 0,
+		}, row)
+		new("UICorner", { CornerRadius = UDim.new(1, 0) }, state)
+
+		local knob = new("Frame", {
+			Size = UDim2.new(0, 12, 0, 12),
+			Position = getter() and UDim2.new(1, -14, 0, 2) or UDim2.new(0, 2, 0, 2),
+			BackgroundColor3 = Color3.fromRGB(250, 250, 255),
+			BorderSizePixel = 0,
+		}, state)
+		new("UICorner", { CornerRadius = UDim.new(1, 0) }, knob)
+
+		local function refresh()
+			local on = getter()
+			state.BackgroundColor3 = on and ACCENT or Color3.fromRGB(55, 58, 70)
+			TweenService:Create(knob, TweenInfo.new(0.12), {
+				Position = on and UDim2.new(1, -14, 0, 2) or UDim2.new(0, 2, 0, 2),
+			}):Play()
+		end
+
+		row.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				setter(not getter())
+				refresh()
+				saveConfig()
+			end
+		end)
+		refresh()
+		return row
+	end
+
+	local function addSlider(text, min, max, decimals, getter, setter)
+		local row = rowBase(40)
+		new("UICorner", { CornerRadius = UDim.new(0, 6) }, row)
+
+		new("TextLabel", {
+			Text = text,
+			Position = UDim2.new(0, 10, 0, 4),
+			Size = UDim2.new(0, 180, 0, 14),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.Gotham,
+			TextSize = 12,
+			TextColor3 = Color3.fromRGB(225, 228, 238),
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}, row)
+
+		local valueLabel = new("TextLabel", {
+			Text = "",
+			Position = UDim2.new(1, -70, 0, 4),
+			Size = UDim2.new(0, 60, 0, 14),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamBold,
+			TextSize = 11,
+			TextColor3 = ACCENT,
+			TextXAlignment = Enum.TextXAlignment.Right,
+		}, row)
+
+		local barBtn = new("TextButton", {
+			Text = "",
+			Position = UDim2.new(0, 10, 0, 26),
+			Size = UDim2.new(1, -20, 0, 6),
+			BackgroundColor3 = Color3.fromRGB(52, 55, 66),
+			AutoButtonColor = false,
+			TextSize = 1,
+		}, row)
+		new("UICorner", { CornerRadius = UDim.new(1, 0) }, barBtn)
+
+		local fill = new("Frame", {
+			Size = UDim2.new(0, 0, 1, 0),
+			BackgroundColor3 = ACCENT,
+			BorderSizePixel = 0,
+		}, barBtn)
+		new("UICorner", { CornerRadius = UDim.new(1, 0) }, fill)
+
+		local function render()
+			local value = getter()
+			local alpha = math.clamp((value - min) / math.max(max - min, 0.0001), 0, 1)
+			fill.Size = UDim2.new(alpha, 0, 1, 0)
+			valueLabel.Text = string.format("%." .. tostring(decimals) .. "f", value)
+		end
+
+		local dragging = false
+		local function setFromX(x)
+			local absX = barBtn.AbsolutePosition.X
+			local width = barBtn.AbsoluteSize.X
+			local alpha = math.clamp((x - absX) / math.max(width, 1), 0, 1)
+			setter(min + (max - min) * alpha)
+			render()
+		end
+
+		barBtn.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				setFromX(input.Position.X)
+			end
+		end)
+		track(UserInputService.InputChanged:Connect(function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+				setFromX(input.Position.X)
+			end
+		end))
+		track(UserInputService.InputEnded:Connect(function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+				dragging = false
+				saveConfig()
+			end
+		end))
+
+		render()
+		return row
+	end
+
+	local function addKeybind(text, getter, setter)
+		local row = rowBase(28)
+		new("UICorner", { CornerRadius = UDim.new(0, 6) }, row)
+
+		new("TextLabel", {
+			Text = text,
+			Position = UDim2.new(0, 10, 0, 0),
+			Size = UDim2.new(0, 170, 1, 0),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.Gotham,
+			TextSize = 12,
+			TextColor3 = Color3.fromRGB(225, 228, 238),
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}, row)
+
+		local btn = new("TextButton", {
+			Text = getter(),
+			Position = UDim2.new(1, -78, 0, 4),
+			Size = UDim2.new(0, 68, 0, 20),
+			BackgroundColor3 = Color3.fromRGB(52, 55, 66),
+			Font = Enum.Font.GothamBold,
+			TextSize = 11,
+			TextColor3 = Color3.fromRGB(235, 240, 250),
+			AutoButtonColor = false,
+		}, row)
+		new("UICorner", { CornerRadius = UDim.new(0, 5) }, btn)
+
+		local listening = false
+		btn.MouseButton1Click:Connect(function()
+			listening = true
+			btn.Text = "..."
+		end)
+		track(UserInputService.InputBegan:Connect(function(input)
+			if listening and input.UserInputType == Enum.UserInputType.Keyboard then
+				listening = false
+				setter(input.KeyCode.Name)
+				btn.Text = input.KeyCode.Name
+				saveConfig()
+			end
+		end))
+		return row
+	end
+
+	local function addCycle(text, options, getter, setter)
+		local row = rowBase(28)
+		new("UICorner", { CornerRadius = UDim.new(0, 6) }, row)
+
+		new("TextLabel", {
+			Text = text,
+			Position = UDim2.new(0, 10, 0, 0),
+			Size = UDim2.new(0, 170, 1, 0),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.Gotham,
+			TextSize = 12,
+			TextColor3 = Color3.fromRGB(225, 228, 238),
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}, row)
+
+		local btn = new("TextButton", {
+			Text = getter(),
+			Position = UDim2.new(1, -98, 0, 4),
+			Size = UDim2.new(0, 88, 0, 20),
+			BackgroundColor3 = Color3.fromRGB(52, 55, 66),
+			Font = Enum.Font.GothamBold,
+			TextSize = 11,
+			TextColor3 = Color3.fromRGB(235, 240, 250),
+			AutoButtonColor = false,
+		}, row)
+		new("UICorner", { CornerRadius = UDim.new(0, 5) }, btn)
+
+		btn.MouseButton1Click:Connect(function()
+			local current = getter()
+			local nextIndex = 1
+			for i, option in ipairs(options) do
+				if option == current then
+					nextIndex = i + 1
+					break
+				end
+			end
+			if nextIndex > #options then nextIndex = 1 end
+			local value = options[nextIndex]
+			setter(value)
+			btn.Text = value
+			saveConfig()
+		end)
+		return row
+	end
+
+	local function addTextBox(text, getter, setter)
+		local row = rowBase(28)
+		new("UICorner", { CornerRadius = UDim.new(0, 6) }, row)
+		new("TextLabel", {
+			Text = text,
+			Position = UDim2.new(0, 10, 0, 0),
+			Size = UDim2.new(0, 96, 1, 0),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.Gotham,
+			TextSize = 12,
+			TextColor3 = Color3.fromRGB(225, 228, 238),
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}, row)
+		local box = new("TextBox", {
+			Text = getter(),
+			PlaceholderText = "rbxassetid://",
+			Position = UDim2.new(0, 104, 0, 4),
+			Size = UDim2.new(1, -114, 0, 20),
+			BackgroundColor3 = Color3.fromRGB(40, 43, 53),
+			Font = Enum.Font.Gotham,
+			TextSize = 11,
+			TextColor3 = Color3.fromRGB(230, 232, 240),
+			PlaceholderColor3 = TEXT_DIM,
+			ClearTextOnFocus = false,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}, row)
+		new("UICorner", { CornerRadius = UDim.new(0, 5) }, box)
+		new("UIPadding", { PaddingLeft = UDim.new(0, 6) }, box)
+		box.FocusLost:Connect(function()
+			setter(box.Text)
+			saveConfig()
+		end)
+		return row
+	end
+
+	local function addButton(text, callback)
+		local btn = new("TextButton", {
+			Text = text,
+			Size = UDim2.new(1, 0, 0, 28),
+			BackgroundColor3 = Color3.fromRGB(38, 42, 54),
+			Font = Enum.Font.GothamBold,
+			TextSize = 12,
+			TextColor3 = Color3.fromRGB(225, 232, 245),
+			AutoButtonColor = false,
+		}, content)
+		new("UICorner", { CornerRadius = UDim.new(0, 6) }, btn)
+		btn.MouseButton1Click:Connect(callback)
+		return btn
+	end
+
+	-- 面板内容
+	section("AIMBOT")
+	addToggle("启用自瞄", function() return Config.aimbot.enabled end, function(v) Config.aimbot.enabled = v end)
+	addCycle("触发方式", { "Hold", "Toggle", "Always" }, function() return Config.aimbot.mode end, function(v) Config.aimbot.mode = v end)
+	addCycle("锁哪个部位", { "Head", "HumanoidRootPart", "UpperTorso" }, function() return Config.aimbot.part end, function(v) Config.aimbot.part = v end)
+	addToggle("自动开火", function() return Config.aimbot.autoFire end, function(v) Config.aimbot.autoFire = v end)
+	addToggle("穿墙也锁(不做视线判断)", function() return not Config.aimbot.wallCheck end, function(v) Config.aimbot.wallCheck = not v end)
+	addToggle("同队不打", function() return Config.aimbot.teamCheck end, function(v) Config.aimbot.teamCheck = v end)
+	addToggle("显示 FOV 圈", function() return Config.aimbot.fovCircle end, function(v) Config.aimbot.fovCircle = v end)
+	addSlider("FOV 半径", 20, 500, 0, function() return Config.aimbot.fov end, function(v) Config.aimbot.fov = v end)
+	addSlider("平滑(越大越慢)", 1, 15, 1, function() return Config.aimbot.smooth end, function(v) Config.aimbot.smooth = v end)
+	addSlider("提前量(秒)", 0, 0.5, 2, function() return Config.aimbot.prediction end, function(v) Config.aimbot.prediction = v end)
+	addKeybind("自瞄按键", function() return Config.aimbot.key end, function(v) Config.aimbot.key = v end)
+
+	section("敌人拉头顶")
+	addToggle("启用", function() return Config.bring.enabled end, function(v)
+		Config.bring.enabled = v
+		if not v then Bring.clearWelds() end
+	end)
+	addCycle("方式", { "Stack", "Hat" }, function() return Config.bring.mode end, function(v) Config.bring.mode = v end)
+	addSlider("离头顶高度", 1, 8, 1, function() return Config.bring.offset end, function(v) Config.bring.offset = v end)
+	addSlider("间距", 1, 8, 1, function() return Config.bring.spacing end, function(v) Config.bring.spacing = v end)
+	addSlider("最大距离", 100, 2000, 0, function() return Config.bring.maxDist end, function(v) Config.bring.maxDist = v end)
+
+	section("皮肤")
+	addToggle("启用换肤", function() return Config.skins.enabled end, function(v)
+		Config.skins.enabled = v
+		if v then Skins.applyAll() end
+	end)
+	addTextBox("自定义贴图", function() return Config.skins.texture end, function(v) Config.skins.texture = v end)
+	addCycle("配色", { "Neon", "Gold", "Blood", "Void", "Ice", "Rainbow", "Default" }, function() return Config.skins.preset end, function(v) Config.skins.preset = v end)
+	addButton("扫一遍游戏里的皮肤资源", function()
+		local found = Skins.scan()
+		notify("找到 " .. tostring(#found) .. " 个皮肤贴图对象")
+	end)
+	addButton("现在套一次皮肤", function()
+		Skins.applyAll()
+		notify("已应用到当前武器")
+	end)
+
+	section("防护")
+	addToggle("防踢(拦 Kick)", function() return Config.anti.antiKick end, function(v) Config.anti.antiKick = v end)
+	addToggle("防传送", function() return Config.anti.antiTeleport end, function(v) Config.anti.antiTeleport = v end)
+	addToggle("反检测", function() return Config.anti.antiDetect end, function(v) Config.anti.antiDetect = v end)
+
+	section("其他")
+	addButton("卸载脚本 (End)", function() UI.destroy() end)
+
+	-- 拖动
+	local dragging, dragStart, startPos = false, nil, nil
+	bar.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = main.Position
+		end
+	end)
+	track(UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		end
+	end))
+	track(UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+
+	UI.gui = gui
+	UI.main = main
+end
+
+function UI.destroy()
+	pcall(function()
+		if UI.gui then UI.gui:Destroy() end
+	end)
+	UI.gui = nil
+end
+
+UI.build()
+
+--=====================================================================
+-- 9. 按键
+--=====================================================================
+track(UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+	local key = input.KeyCode.Name
+	if key == Config.ui.key then
+		UI.open = not UI.open
+		if UI.main then UI.main.Visible = UI.open end
+	elseif key == Config.ui.panicKey then
+		if getgenv and getgenv().GSHub and getgenv().GSHub.unload then
+			getgenv().GSHub.unload()
+		end
+	elseif key == Config.aimbot.key and Config.aimbot.mode == "Toggle" then
+		Aimbot.toggled = not Aimbot.toggled
+	elseif key == Config.bring.key then
+		Config.bring.enabled = not Config.bring.enabled
+		if not Config.bring.enabled then Bring.clearWelds() end
+		notify(Config.bring.enabled and "拉人: 开" or "拉人: 关")
+	end
+end))
+
+--=====================================================================
+-- 10. 卸载 + 注册
+--=====================================================================
+local function unload()
+	pcall(function()
+		Config.bring.enabled = false
+		Config.aimbot.enabled = false
+		Bring.clearWelds()
+		Anti.teardown()
+		UI.destroy()
+		for _, conn in ipairs(Connections) do
+			pcall(function() conn:Disconnect() end)
+		end
+		Connections = {}
+		if fovCircle then
+			pcall(function() fovCircle:Remove() end)
+			fovCircle = nil
+		end
+		saveConfig()
+		if getgenv then getgenv().GSHub = nil end
+	end)
+end
+
+getgenv().GSHub = {
+	version = VERSION,
+	unload = unload,
+	config = Config,
+	aimbot = Aimbot,
+	bring = Bring,
+	skins = Skins,
+	anti = Anti,
+}
+
+notify("GS Hub v" .. VERSION .. " 已加载 | RightShift 菜单 | End 卸载")
+
+track(LocalPlayer.CharacterAdded:Connect(function()
+	task.wait(1)
+	if Config.skins.enabled then Skins.applyAll() end
+end))
+
+-- ===== END 10_core.lua =====
+
+-- ===== BEGIN 90_ext.lua (918 行) =====
+--=====================================================================
+-- 扩展层整体包一层作用域, 避免主 chunk 的 local 数量超 Lua 上限(200)
+--=====================================================================
+do
+
+local ENV = _G.GSHUB_ENV
+
+--=====================================================================
+-- EXT-0. 扩展配置 (独立于内核 config.json, 存 GSHub/ext.json)
+--=====================================================================
+local EXT_FILE = "GSHub/ext.json"
+local EXT_DIR = "GSHub"
+
+local ExtConfig = {
+	esp = {
+		enabled = true,
+		maxDist = 800,
+		showName = true,
+		showDist = true,
+		showHealth = true,
+		showBox = true,
+		teamFilter = true,   -- 过滤同队
+		alpha = 0.88,
+	},
+	hud = {
+		enabled = true,
+	},
+	guard = {
+		enabled = true,
+		limit = 45,          -- 连续错误达到这个数就关掉重模块
+	},
+	keys = {
+		panel = "K",
+		esp = "V",
+		hud = "H",
+	},
+}
+
+local function mergeInto(dst, src)
+	if type(src) ~= "table" then return dst end
+	for k, v in pairs(src) do
+		if type(v) == "table" and type(dst[k]) == "table" then
+			mergeInto(dst[k], v)
+		else
+			dst[k] = v
+		end
+	end
+	return dst
+end
+
+local function loadExtConfig()
+	if not (isfile and readfile) then return end
+	pcall(function()
+		if not isfile(EXT_FILE) then return end
+		local raw = readfile(EXT_FILE)
+		if not raw or raw == "" then return end
+		local ok, data = pcall(function() return HttpService:JSONDecode(raw) end)
+		if ok and type(data) == "table" then mergeInto(ExtConfig, data) end
+	end)
+end
+
+local function saveExtConfig()
+	if not (writefile and makefolder) then return end
+	pcall(function()
+		if not isfolder(EXT_DIR) then makefolder(EXT_DIR) end
+		writefile(EXT_FILE, HttpService:JSONEncode(ExtConfig))
+	end)
+end
+loadExtConfig()
+
+--=====================================================================
+-- EXT-1. 通用工具: 颜色 / 投影 / 取角色
+--=====================================================================
+local ECOLOR = {
+	enemy   = Color3.fromRGB(255, 92, 92),
+	enemyHp = Color3.fromRGB(255, 70, 90),
+	teammate= Color3.fromRGB(120, 200, 255),
+	visible = Color3.fromRGB(120, 255, 160),
+	dim     = Color3.fromRGB(160, 165, 180),
+	panelBg = Color3.fromRGB(16, 17, 22),
+	panelRow= Color3.fromRGB(32, 35, 44),
+	accent  = Color3.fromRGB(120, 200, 255),
+}
+
+local function nowClock()
+	return os.clock()
+end
+
+local function getCam()
+	return Workspace.CurrentCamera
+end
+
+local function projectToScreen(pos)
+	local cam = getCam()
+	if not cam then return nil end
+	local ok, sp, onScreen = pcall(function()
+		local v, vis = cam:WorldToViewportPoint(pos)
+		return v, vis
+	end)
+	if not ok or not sp then return nil end
+	return sp, onScreen
+end
+
+local function getCharacter(plr)
+	if plr == LocalPlayer then return nil end
+	local ok, char = pcall(function() return plr.Character end)
+	if not ok or not char then return nil end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hum or (hum.Health or 0) <= 0 then return nil end
+	local root = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+	if not root then return nil end
+	local head = char:FindFirstChild("Head")
+	return char, hum, root, head or root
+end
+
+local function sameTeam(plr)
+	local ok, same = pcall(function()
+		return plr.Team ~= nil and plr.Team == LocalPlayer.Team
+	end)
+	return ok and same
+end
+
+local function distTo(root)
+	local myChar = LocalPlayer.Character
+	if not myChar then return 0 end
+	local myRoot = myChar:FindFirstChild("HumanoidRootPart") or myChar.PrimaryPart
+	if not myRoot then return 0 end
+	local ok, d = pcall(function() return (root.Position - myRoot.Position).Magnitude end)
+	return (ok and d) or 0
+end
+
+--=====================================================================
+-- EXT-2. 看护 (Guard): 任何模块跑挂了不让整个脚本炸掉
+--=====================================================================
+local Guard = {
+	consecutive = 0,
+	lastError = nil,
+	dropped = {},
+}
+
+function Guard.run(where, fn, ...)
+	if not ExtConfig.guard.enabled then
+		return ENV.safe(where, fn, ...)
+	end
+	local ok, res = pcall(fn, ...)
+	if ok then
+		if Guard.consecutive > 0 then Guard.consecutive = 0 end
+		return res
+	end
+	Guard.consecutive = Guard.consecutive + 1
+	Guard.lastError = tostring(res)
+	ENV.logError(where, res)
+	if Guard.consecutive >= (ExtConfig.guard.limit or 45) then
+		Guard.consecutive = 0
+		if ExtConfig.esp.enabled then
+			ExtConfig.esp.enabled = false
+			Guard.dropped.esp = true
+			notify("[看护] ESP 连续出错已临时关闭")
+		end
+		if ExtConfig.hud.enabled then
+			ExtConfig.hud.enabled = false
+			Guard.dropped.hud = true
+			notify("[看护] HUD 连续出错已临时关闭")
+		end
+	end
+	return nil
+end
+
+--=====================================================================
+-- EXT-3. ESP: 敌人名字 / 距离 / 血量 / 方框
+--    有 Drawing 走 Drawing (性能最好), 没有就降级成 GUI 文本
+--=====================================================================
+local ESP = {
+	items = {},
+	pool = {},
+	byPlayer = {},
+	usingDrawing = (ENV.caps.drawing == true),
+}
+
+local function makeDrawingItem()
+	local D = Drawing
+	local item = {}
+	item.box = D.new("Square")
+	item.box.Thickness = 1
+	item.box.Filled = false
+	item.box.Visible = false
+
+	item.hpBg = D.new("Square")
+	item.hpBg.Filled = true
+	item.hpBg.Color = Color3.fromRGB(30, 30, 36)
+	item.hpBg.Visible = false
+
+	item.hpBar = D.new("Square")
+	item.hpBar.Filled = true
+	item.hpBar.Color = ECOLOR.enemyHp
+	item.hpBar.Visible = false
+
+	item.name = D.new("Text")
+	item.name.Size = 14
+	item.name.Center = true
+	item.name.Outline = true
+	item.name.Font = 2
+	item.name.Visible = false
+
+	item.info = D.new("Text")
+	item.info.Size = 13
+	item.info.Center = true
+	item.info.Outline = true
+	item.info.Font = 2
+	item.info.Visible = false
+	return item
+end
+
+local function hideDrawingItem(item)
+	if not item then return end
+	for _, k in ipairs({ "box", "hpBg", "hpBar", "name", "info" }) do
+		local obj = item[k]
+		if obj then pcall(function() obj.Visible = false end) end
+	end
+end
+
+local function destroyDrawingItem(item)
+	if not item then return end
+	for _, k in ipairs({ "box", "hpBg", "hpBar", "name", "info" }) do
+		local obj = item[k]
+		if obj then pcall(function() obj:Remove() end) end
+	end
+end
+
+-- GUI 降级: 一个 ScreenGui + 每人一个 TextLabel
+ESP.gui = nil
+ESP.guiPool = {}
+
+local function getEspGui()
+	if ESP.usingDrawing then return nil end
+	if ESP.gui and ESP.gui.Parent then return ESP.gui end
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	if not pg then
+		local ok, res = pcall(function() return LocalPlayer:WaitForChild("PlayerGui", 5) end)
+		if ok then pg = res end
+	end
+	if not pg then return nil end
+	ESP.gui = new("ScreenGui", {
+		Name = "GSHub_ESP",
+		ResetOnSpawn = false,
+		IgnoreGuiInset = true,
+		DisplayOrder = 5,
+	}, pg)
+	return ESP.gui
+end
+
+local function getGuiLabel(plr)
+	local label = ESP.guiPool[plr]
+	if label and label.Parent then return label end
+	local gui = getEspGui()
+	if not gui then return nil end
+	label = new("TextLabel", {
+		Name = "ESP_" .. tostring(plr.Name),
+		BackgroundTransparency = 1,
+		Size = UDim2.new(0, 180, 0, 34),
+		AnchorPoint = Vector2.new(0.5, 1),
+		Font = Enum.Font.GothamBold,
+		TextSize = 13,
+		TextColor3 = ECOLOR.enemy,
+		TextStrokeTransparency = 0.2,
+		TextStrokeColor3 = Color3.fromRGB(0, 0, 0),
+		Visible = false,
+	}, gui)
+	ESP.guiPool[plr] = label
+	return label
+end
+
+local function clearEspGui()
+	for _, label in pairs(ESP.guiPool) do
+		pcall(function() label:Destroy() end)
+	end
+	ESP.guiPool = {}
+	if ESP.gui then
+		pcall(function() ESP.gui:Destroy() end)
+		ESP.gui = nil
+	end
+end
+
+function ESP.hideAll()
+	for _, item in pairs(ESP.items) do hideDrawingItem(item) end
+	for _, label in pairs(ESP.guiPool) do
+		pcall(function() label.Visible = false end)
+	end
+end
+
+function ESP.update()
+	if not ExtConfig.esp.enabled then
+		ESP.hideAll()
+		return
+	end
+
+	local players = Players:GetPlayers()
+	local seen = {}
+	local cfg = ExtConfig.esp
+
+	for _, plr in ipairs(players) do
+		local char, hum, root, head = getCharacter(plr)
+		local skip = (char == nil)
+		if not skip and cfg.teamFilter and sameTeam(plr) then skip = true end
+
+		local d = 0
+		if not skip then
+			d = distTo(root)
+			if d > cfg.maxDist then skip = true end
+		end
+
+		if skip then
+			local item = ESP.items[plr]
+			if item then hideDrawingItem(item) end
+			local label = ESP.guiPool[plr]
+			if label then label.Visible = false end
+		else
+			seen[plr] = true
+			local headPos = head.Position
+			local sp, onScreen = projectToScreen(headPos)
+			local footSp = projectToScreen(root.Position)
+			if sp and (sp.Z or 1) > 0 and onScreen ~= false then
+				local height = 40
+				if footSp and footSp.Y then
+					height = math.abs(sp.Y - footSp.Y)
+				end
+				if height < 18 then height = 18 end
+				if height > 400 then height = 400 end
+				local width = height * 0.62
+				local hpPct = 1
+				if hum and (hum.MaxHealth or 0) > 0 then
+					hpPct = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+				end
+
+				if ESP.usingDrawing then
+					local item = ESP.items[plr]
+					if not item then
+						item = makeDrawingItem()
+						ESP.items[plr] = item
+					end
+					local color = ECOLOR.enemy
+					if cfg.showBox then
+						item.box.Visible = true
+						item.box.Color = color
+						item.box.Thickness = 1
+						item.box.Position = Vector2.new(sp.X - width / 2, sp.Y)
+						item.box.Size = Vector2.new(width, height)
+					else
+						item.box.Visible = false
+					end
+					if cfg.showHealth then
+						local barW = width
+						local barH = 3
+						local bx = sp.X - width / 2
+						local by = sp.Y + height + 2
+						item.hpBg.Visible = true
+						item.hpBg.Color = Color3.fromRGB(25, 25, 30)
+						item.hpBg.Position = Vector2.new(bx, by)
+						item.hpBg.Size = Vector2.new(barW, barH)
+						item.hpBar.Visible = true
+						item.hpBar.Color = ECOLOR.enemyHp
+						item.hpBar.Position = Vector2.new(bx, by)
+						item.hpBar.Size = Vector2.new(barW * hpPct, barH)
+					else
+						item.hpBg.Visible = false
+						item.hpBar.Visible = false
+					end
+					if cfg.showName then
+						item.name.Visible = true
+						item.name.Text = tostring(plr.Name)
+						item.name.Color = color
+						item.name.Position = Vector2.new(sp.X, sp.Y - 16)
+					else
+						item.name.Visible = false
+					end
+					if cfg.showDist then
+						local parts = {}
+						if cfg.showDist then table.insert(parts, string.format("%dm", math.floor(d))) end
+						table.insert(parts, string.format("HP %d", math.floor((hum and hum.Health) or 0)))
+						item.info.Visible = true
+						item.info.Text = table.concat(parts, "  ")
+						item.info.Color = ECOLOR.dim
+						item.info.Position = Vector2.new(sp.X, sp.Y + height + 5)
+					else
+						item.info.Visible = false
+					end
+				else
+					local label = getGuiLabel(plr)
+					if label then
+						label.Visible = true
+						label.Position = UDim2.new(0, math.floor(sp.X), 0, math.floor(sp.Y) - 10)
+						local txt = ""
+						if cfg.showName then txt = tostring(plr.Name) end
+						if cfg.showDist then txt = txt .. "  " .. string.format("%dm", math.floor(d)) end
+						label.Text = txt .. "  HP" .. tostring(math.floor((hum and hum.Health) or 0))
+						label.TextColor3 = ECOLOR.enemy
+					end
+				end
+			else
+				local item = ESP.items[plr]
+				if item then hideDrawingItem(item) end
+				local label = ESP.guiPool[plr]
+				if label then label.Visible = false end
+			end
+		end
+	end
+
+	-- 清理掉已经不存在 / 已死亡的目标
+	for plr, item in pairs(ESP.items) do
+		if not seen[plr] then hideDrawingItem(item) end
+	end
+end
+
+function ESP.shutdown()
+	for plr, item in pairs(ESP.items) do
+		destroyDrawingItem(item)
+		ESP.items[plr] = nil
+	end
+	clearEspGui()
+end
+
+--=====================================================================
+-- EXT-4. HUD: 帧率 / 延迟 / 敌人数 / 模块状态 / 运行时长
+--=====================================================================
+local HUD = {
+	frames = 0,
+	acc = 0,
+	fps = 0,
+	startedAt = os.time(),
+	ping = nil,
+	pingClock = 0,
+	label = nil,
+}
+
+local function getPing()
+	local ok, v = pcall(function()
+		local Stats = game:GetService("Stats")
+		return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+	end)
+	if ok and type(v) == "number" then return math.floor(v) end
+	return nil
+end
+
+function HUD.ensureGui()
+	if HUD.label and HUD.label.Parent then return end
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	if not pg then
+		local ok, res = pcall(function() return LocalPlayer:WaitForChild("PlayerGui", 5) end)
+		if ok then pg = res end
+	end
+	if not pg then return end
+	local gui = new("ScreenGui", {
+		Name = "GSHub_HUD",
+		ResetOnSpawn = false,
+		IgnoreGuiInset = true,
+		DisplayOrder = 4,
+	}, pg)
+	HUD.gui = gui
+	HUD.label = new("TextLabel", {
+		Name = "HUD",
+		BackgroundTransparency = 0.25,
+		BackgroundColor3 = Color3.fromRGB(14, 15, 20),
+		BorderSizePixel = 0,
+		Size = UDim2.new(0, 210, 0, 84),
+		Position = UDim2.new(1, -226, 0, 16),
+		Font = Enum.Font.Code,
+		TextSize = 13,
+		TextColor3 = Color3.fromRGB(225, 232, 245),
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		Text = "",
+		Visible = true,
+	}, gui)
+	new("UICorner", { CornerRadius = UDim.new(0, 6) }, HUD.label)
+	new("UIPadding", {
+		PaddingLeft = UDim.new(0, 8),
+		PaddingTop = UDim.new(0, 6),
+	}, HUD.label)
+end
+
+function HUD.destroy()
+	if HUD.gui then pcall(function() HUD.gui:Destroy() end) end
+	HUD.gui = nil
+	HUD.label = nil
+end
+
+function HUD.update(dt)
+	if not ExtConfig.hud.enabled then
+		if HUD.label then HUD.label.Visible = false end
+		return
+	end
+	HUD.ensureGui()
+	if not HUD.label then return end
+	HUD.label.Visible = true
+
+	HUD.frames = HUD.frames + 1
+	HUD.acc = HUD.acc + (dt or 0)
+	if HUD.acc >= 0.5 then
+		HUD.fps = math.floor(HUD.frames / HUD.acc)
+		HUD.frames = 0
+		HUD.acc = 0
+		HUD.ping = getPing()
+	end
+
+	local enemies = 0
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if getCharacter(plr) then enemies = enemies + 1 end
+	end
+
+	local elapsed = os.time() - HUD.startedAt
+	local mins = math.floor(elapsed / 60)
+	local secs = elapsed % 60
+
+	local function flag(v) return v and "ON" or "OFF" end
+	local lines = {
+		"GS HUB  v" .. ENV.VERSION,
+		string.format("FPS %d   PING %s", HUD.fps, HUD.ping and (tostring(HUD.ping) .. "ms") or "--"),
+		string.format("敌人 %d   ESP %s", enemies, flag(ExtConfig.esp.enabled)),
+		string.format("AIM %s  BRING %s  SKIN %s",
+			flag(Config.aimbot.enabled), flag(Config.bring.enabled), flag(Config.skins.enabled)),
+		string.format("运行 %02d:%02d", mins, secs),
+	}
+	HUD.label.Text = table.concat(lines, "\n")
+end
+
+--=====================================================================
+-- EXT-5. 扩展面板 (独立小窗, 按键 K)
+--=====================================================================
+local Panel = { open = false, rows = {} }
+
+local function styleButton(btn, w)
+	btn.AutoButtonColor = false
+	btn.BackgroundColor3 = ECOLOR.panelRow
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 12
+	btn.TextColor3 = Color3.fromRGB(225, 232, 245)
+	btn.Size = UDim2.new(w or 1, w and -4 or 0, 0, 26)
+	btn.BorderSizePixel = 0
+	new("UICorner", { CornerRadius = UDim.new(0, 5) }, btn)
+	return btn
+end
+
+function Panel.build()
+	if Panel.gui and Panel.gui.Parent then return end
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	if not pg then
+		local ok, res = pcall(function() return LocalPlayer:WaitForChild("PlayerGui", 5) end)
+		if ok then pg = res end
+	end
+	if not pg then return end
+
+	local gui = new("ScreenGui", {
+		Name = "GSHub_Ext",
+		ResetOnSpawn = false,
+		IgnoreGuiInset = true,
+		DisplayOrder = 20,
+	}, pg)
+
+	local main = new("Frame", {
+		Name = "Main",
+		Size = UDim2.new(0, 250, 0, 330),
+		Position = UDim2.new(0, 24, 0, 220),
+		BackgroundColor3 = ECOLOR.panelBg,
+		BorderSizePixel = 0,
+		Visible = Panel.open,
+	}, gui)
+	new("UICorner", { CornerRadius = UDim.new(0, 8) }, main)
+	new("UIStroke", { Color = Color3.fromRGB(52, 58, 72), Thickness = 1 }, main)
+
+	local bar = new("Frame", {
+		Name = "Bar",
+		Size = UDim2.new(1, 0, 0, 30),
+		BackgroundColor3 = Color3.fromRGB(24, 26, 33),
+		BorderSizePixel = 0,
+	}, main)
+	new("UICorner", { CornerRadius = UDim.new(0, 8) }, bar)
+
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, -60, 1, 0),
+		Position = UDim2.new(0, 10, 0, 0),
+		Font = Enum.Font.GothamBold,
+		TextSize = 13,
+		TextColor3 = ECOLOR.accent,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "GS HUB · EXT",
+	}, bar)
+
+	local close = new("TextButton", {
+		Size = UDim2.new(0, 22, 0, 22),
+		Position = UDim2.new(1, -28, 0, 4),
+		BackgroundColor3 = Color3.fromRGB(58, 34, 38),
+		Text = "×",
+		Font = Enum.Font.GothamBold,
+		TextSize = 16,
+		TextColor3 = Color3.fromRGB(255, 170, 170),
+		BorderSizePixel = 0,
+		AutoButtonColor = false,
+	}, bar)
+	new("UICorner", { CornerRadius = UDim.new(0, 5) }, close)
+	close.MouseButton1Click:Connect(function()
+		Panel.open = false
+		main.Visible = false
+	end)
+
+	local list = new("Frame", {
+		Name = "List",
+		Size = UDim2.new(1, -16, 1, -74),
+		Position = UDim2.new(0, 8, 0, 36),
+		BackgroundTransparency = 1,
+	}, main)
+	local layout = new("UIListLayout", {
+		Padding = UDim.new(0, 4),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}, list)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+
+	local order = 0
+
+	local function addRow(text, onClick, w)
+		order = order + 1
+		local btn = new("TextButton", {
+			Text = tostring(text),
+			LayoutOrder = order,
+			BackgroundColor3 = ECOLOR.panelRow,
+			AutoButtonColor = false,
+			Font = Enum.Font.GothamBold,
+			TextSize = 12,
+			TextColor3 = Color3.fromRGB(225, 232, 245),
+			Size = UDim2.new(w or 1, w and -4 or 0, 0, 26),
+			BorderSizePixel = 0,
+		}, list)
+		new("UICorner", { CornerRadius = UDim.new(0, 5) }, btn)
+		if onClick then
+			btn.MouseButton1Click:Connect(onClick)
+		end
+		return btn
+	end
+
+	local function addPair(left, lfn, right, rfn)
+		order = order + 1
+		local holder = new("Frame", {
+			Size = UDim2.new(1, 0, 0, 26),
+			BackgroundTransparency = 1,
+			LayoutOrder = order,
+		}, list)
+		local lb = new("TextButton", {
+			Text = tostring(left),
+			Size = UDim2.new(0.5, -3, 1, 0),
+			Position = UDim2.new(0, 0, 0, 0),
+			BackgroundColor3 = ECOLOR.panelRow,
+			AutoButtonColor = false,
+			Font = Enum.Font.GothamBold,
+			TextSize = 12,
+			TextColor3 = Color3.fromRGB(225, 232, 245),
+			BorderSizePixel = 0,
+		}, holder)
+		new("UICorner", { CornerRadius = UDim.new(0, 5) }, lb)
+		lb.MouseButton1Click:Connect(lfn)
+
+		local rb = new("TextButton", {
+			Text = tostring(right),
+			Size = UDim2.new(0.5, -3, 1, 0),
+			Position = UDim2.new(0.5, 3, 0, 0),
+			BackgroundColor3 = ECOLOR.panelRow,
+			AutoButtonColor = false,
+			Font = Enum.Font.GothamBold,
+			TextSize = 12,
+			TextColor3 = Color3.fromRGB(225, 232, 245),
+			BorderSizePixel = 0,
+		}, holder)
+		new("UICorner", { CornerRadius = UDim.new(0, 5) }, rb)
+		rb.MouseButton1Click:Connect(rfn)
+		return holder
+	end
+
+	local toggleBtns = {}
+
+	local function refreshToggles()
+		for key, btn in pairs(toggleBtns) do
+			btn.Text = key .. ": " .. (btn.attr and "ON" or "OFF")
+		end
+	end
+
+	local function addToggle(key, labelText, attr)
+		local btn = addRow(labelText, nil)
+		btn.attr = attr
+		toggleBtns[labelText] = btn
+		btn.Text = labelText .. ": " .. (attr and "ON" or "OFF")
+		btn.MouseButton1Click:Connect(function()
+			btn.attr = not btn.attr
+			btn.Text = labelText .. ": " .. (btn.attr and "ON" or "OFF")
+			Panel.applyToggle(labelText, btn.attr)
+		end)
+		return btn
+	end
+
+	Panel.toggles = toggleBtns
+	Panel.applyToggle = function(labelText, value)
+		if labelText == "ESP" then
+			ExtConfig.esp.enabled = value
+			if not value then ESP.hideAll() end
+		elseif labelText == "HUD" then
+			ExtConfig.hud.enabled = value
+			if not value and HUD.label then HUD.label.Visible = false end
+		elseif labelText == "名字" then
+			ExtConfig.esp.showName = value
+		elseif labelText == "距离" then
+			ExtConfig.esp.showDist = value
+		elseif labelText == "血条" then
+			ExtConfig.esp.showHealth = value
+		elseif labelText == "方框" then
+			ExtConfig.esp.showBox = value
+		elseif labelText == "同队过滤" then
+			ExtConfig.esp.teamFilter = value
+		end
+		saveExtConfig()
+	end
+
+	addToggle("ESP", "ESP", ExtConfig.esp.enabled)
+	addToggle("HUD", "HUD", ExtConfig.hud.enabled)
+	addToggle("名字", "名字", ExtConfig.esp.showName)
+	addToggle("距离", "距离", ExtConfig.esp.showDist)
+	addToggle("血条", "血条", ExtConfig.esp.showHealth)
+	addToggle("方框", "方框", ExtConfig.esp.showBox)
+	addToggle("同队过滤", "同队过滤", ExtConfig.esp.teamFilter)
+
+	local distBtn = addRow("", function() end)
+	local function refreshDist()
+		distBtn.Text = "显示距离上限: " .. tostring(ExtConfig.esp.maxDist) .. "m"
+	end
+	refreshDist()
+	addPair("-200", function()
+		ExtConfig.esp.maxDist = math.max(50, ExtConfig.esp.maxDist - 200)
+		refreshDist()
+		saveExtConfig()
+	end, "+200", function()
+		ExtConfig.esp.maxDist = math.min(3000, ExtConfig.esp.maxDist + 200)
+		refreshDist()
+		saveExtConfig()
+	end)
+
+	addPair("导出配置", function()
+		local payload = { ext = ExtConfig, core = Config, v = ENV.VERSION }
+		local ok, json = pcall(function() return HttpService:JSONEncode(payload) end)
+		if not ok then notify("导出失败"); return end
+		Panel.lastExport = json
+		if ENV.clipboardOut(json) then
+			notify("配置已复制到剪贴板 (" .. tostring(#json) .. " 字符)")
+		else
+			notify("执行器不支持剪贴板, 配置已存在内存 (ext.lastExport)")
+		end
+	end, "导入配置", function()
+		local text = ENV.clipboardIn()
+		if not text or text == "" then notify("剪贴板为空或不支持读取"); return end
+		local ok, data = pcall(function() return HttpService:JSONDecode(text) end)
+		if not ok or type(data) ~= "table" then notify("配置格式不对"); return end
+		if type(data.ext) == "table" then mergeInto(ExtConfig, data.ext) end
+		if type(data.core) == "table" then mergeInto(Config, data.core) end
+		saveExtConfig()
+		saveConfig()
+		notify("配置已导入")
+	end)
+
+	addRow("全部关闭 (AIM/BRING/SKIN/ESP)", function()
+		Config.aimbot.enabled = false
+		Config.bring.enabled = false
+		Bring.clearWelds()
+		Config.skins.enabled = false
+		ExtConfig.esp.enabled = false
+		ESP.hideAll()
+		saveConfig()
+		saveExtConfig()
+		notify("已全部关闭")
+	end)
+
+	-- 拖动
+	local dragging, dragStart, startPos = false, nil, nil
+	bar.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = main.Position
+		end
+	end)
+	track(UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			main.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + delta.X,
+				startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		end
+	end))
+	track(UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+
+	Panel.gui = gui
+	Panel.main = main
+	Panel.refresh = refreshToggles
+end
+
+function Panel.toggle(value)
+	if Panel.open == nil then Panel.open = false end
+	if value ~= nil then Panel.open = value else Panel.open = not Panel.open end
+	if not Panel.gui or not Panel.gui.Parent then
+		Panel.open = true
+		Panel.build()
+	end
+	if Panel.main then Panel.main.Visible = Panel.open end
+end
+
+function Panel.destroy()
+	if Panel.gui then pcall(function() Panel.gui:Destroy() end) end
+	Panel.gui = nil
+	Panel.main = nil
+end
+
+--=====================================================================
+-- EXT-6. 主循环: ESP + HUD 每帧更新 (带节流与看护)
+--=====================================================================
+local ExtRuntime = {
+	frame = 0,
+	lastDt = 0,
+}
+
+track(RunService.RenderStepped:Connect(function(dt)
+	ExtRuntime.frame = ExtRuntime.frame + 1
+	ExtRuntime.lastDt = dt
+	-- HUD 每帧算 (开销极小), ESP 每 2 帧刷一次省性能
+	Guard.run("HUD.update", HUD.update, dt)
+	if ExtRuntime.frame % 2 == 0 then
+		Guard.run("ESP.update", ESP.update)
+	end
+end))
+
+-- 重生后清一下缓存, 避免指向旧角色
+track(LocalPlayer.CharacterAdded:Connect(function()
+	task.wait(0.6)
+	Guard.run("ESP.reset", function()
+		ESP.hideAll()
+	end)
+end))
+
+track(Players.PlayerRemoving:Connect(function(plr)
+	local item = ESP.items[plr]
+	if item then
+		destroyDrawingItem(item)
+		ESP.items[plr] = nil
+	end
+	local label = ESP.guiPool[plr]
+	if label then
+		pcall(function() label:Destroy() end)
+		ESP.guiPool[plr] = nil
+	end
+end))
+
+--=====================================================================
+-- EXT-7. 按键
+--=====================================================================
+track(UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+	local key = input.KeyCode.Name
+
+	if key == ExtConfig.keys.panel then
+		Panel.toggle()
+	elseif key == ExtConfig.keys.esp then
+		ExtConfig.esp.enabled = not ExtConfig.esp.enabled
+		if not ExtConfig.esp.enabled then ESP.hideAll() end
+		if Panel.refresh then Panel.refresh() end
+		notify("ESP: " .. (ExtConfig.esp.enabled and "开" or "关"))
+	elseif key == ExtConfig.keys.hud then
+		ExtConfig.hud.enabled = not ExtConfig.hud.enabled
+		if not ExtConfig.hud.enabled then
+			if HUD.label then HUD.label.Visible = false end
+		end
+		if Panel.refresh then Panel.refresh() end
+		notify("HUD: " .. (ExtConfig.hud.enabled and "开" or "关"))
+	end
+end))
+
+--=====================================================================
+-- EXT-8. 注册 + 卸载接管
+--=====================================================================
+local coreHub = getgenv().GSHub
+if coreHub then
+	coreHub.version = ENV.VERSION
+	coreHub.ext = {
+		config = ExtConfig,
+		esp = ESP,
+		hud = HUD,
+		guard = Guard,
+		panel = Panel,
+		save = saveExtConfig,
+		env = ENV,
+	}
+
+	local baseUnload = coreHub.unload
+	coreHub.unload = function()
+		pcall(function()
+			ESP.shutdown()
+			HUD.destroy()
+			Panel.destroy()
+			saveExtConfig()
+		end)
+		if baseUnload then baseUnload() end
+	end
+end
+
+notify("扩展就绪 · ESP(V) · HUD(H) · 扩展面板(K) · 看护已启用")
+
+end -- // 扩展层作用域结束
+
+-- ===== END 90_ext.lua =====
